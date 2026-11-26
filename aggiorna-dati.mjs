@@ -312,6 +312,44 @@ function parseDataflowCatalogPayload(payloadText) {
   }
   return items;
 }
+function sdmxJsonName(v) {
+  if (!v) return "";
+  if (typeof v.name === "string") return v.name;
+  if (v.name && typeof v.name === "object") return v.name.it ?? v.name.en ?? Object.values(v.name)[0] ?? "";
+  return v.id ?? "";
+}
+function parseSdmxJsonData(payloadText) {
+  const json = JSON.parse(payloadText);
+  const dataSets = json.data?.dataSets ?? json.dataSets ?? [];
+  const obsDims = json.data?.structure?.dimensions?.observation ?? json.structure?.dimensions?.observation ?? [];
+  const dims = obsDims.map((d, i) => ({
+    id: d.id,
+    keyPosition: typeof d.keyPosition === "number" ? d.keyPosition : i,
+    values: (d.values ?? []).map((v) => ({ code: v.id ?? "", label: sdmxJsonName(v) || (v.id ?? "") }))
+  }));
+  if (dataSets.length === 0 || !dataSets[0].observations || obsDims.length === 0) {
+    return { headers: [], rows: [], dims };
+  }
+  const territoryIdx = obsDims.findIndex((d) => /^(ITTER107|REF_AREA)$/i.test(d.id));
+  const headers = [...obsDims.map((d) => d.id), "OBS_VALUE"];
+  if (territoryIdx >= 0) headers.push("REF_AREA_LABEL");
+  const rows = [];
+  for (const [obsKey, obsVal] of Object.entries(dataSets[0].observations)) {
+    const indices = obsKey.split(":").map(Number);
+    const row = {};
+    obsDims.forEach((dim, dimIdx) => {
+      const item = dim.values?.[indices[dimIdx]];
+      row[dim.id] = item?.id ?? "";
+      if (dimIdx === territoryIdx) row["REF_AREA_LABEL"] = sdmxJsonName(item);
+    });
+    const numericRaw = Array.isArray(obsVal) ? obsVal[0] : obsVal;
+    row["OBS_VALUE"] = numericRaw !== void 0 && numericRaw !== null ? String(numericRaw) : "";
+    rows.push(row);
+  }
+  return { headers, rows, dims };
+}
+var ACCEPT_SDMX_JSON = "application/vnd.sdmx.data+json;version=1.0";
+var ACCEPT_SDMX_CSV = "application/vnd.sdmx.data+csv;version=1.0.0, text/csv;q=0.9, application/vnd.sdmx.data+json;version=1.0;q=0.8";
 var defaultSdmxRateLimiter = new SdmxRateLimiter(5, 6e4);
 var SAMPLE_SDMX_CSV_PAYLOAD = [
   "DATAFLOW,FREQ,ITTER107,Territorio,TIPO_DATO,TIME_PERIOD,OBS_VALUE,UNIT_MEASURE",
@@ -457,7 +495,18 @@ var DIM_LABEL_FALLBACK = {
   UNIT_MEASURE: "Unit\xE0 di misura",
   CITIZENSHIP: "Cittadinanza",
   CITTADINANZA: "Cittadinanza",
-  MARITAL_STATUS: "Stato civile"
+  MARITAL_STATUS: "Stato civile",
+  GENDER: "Sesso",
+  INDICATOR: "Indicatore",
+  EDU_LEV_HIGHEST: "Titolo di studio",
+  COUNTRY_BIRTH: "Paese di nascita",
+  HOUSEHOLD_TYPE: "Tipo di famiglia",
+  TYPE_OF_BUILDING: "Tipo di edificio",
+  NUM_MEMB: "Numero di componenti",
+  LABPROF_STATUS: "Condizione professionale",
+  ECON_ACTIVITY: "Attivit\xE0 economica",
+  NACE_REV2: "Attivit\xE0 economica",
+  CLASS_SIZE: "Classe di addetti"
 };
 function prettifyDimId(id) {
   const up = id.toUpperCase();
@@ -588,6 +637,21 @@ function slimStructure(structure) {
     )
   };
 }
+function structureFromSample(flowId, dsd, sample) {
+  const byId = new Map(sample.dims.map((d) => [d.id, d]));
+  const time = sample.dims.find((d) => /^TIME_PERIOD$/i.test(d.id));
+  const latest = time?.values.map((v) => v.code).sort().pop();
+  return {
+    flowId,
+    latestPeriod: latest,
+    dimensions: dsd.dimensions.map((d) => {
+      const got = byId.get(d.id);
+      if (d.isTerritory || !got) return d.isTerritory ? { ...d, values: [] } : d;
+      const values = got.values.filter((v) => v.code);
+      return { ...d, values, defaultCode: pickDefaultCode(d.id, values) };
+    })
+  };
+}
 
 // scripts/scelta.ts
 var TEMI = [
@@ -658,6 +722,13 @@ var T_CATALOGO = 15 * 6e4;
 var RIPROVA_ERRORI_GIORNI = 7;
 var statoPath = path.join(OUT, "stato.json");
 var stato = fs.existsSync(statoPath) ? { strutture: {}, valori: {}, errori: {}, ...JSON.parse(fs.readFileSync(statoPath, "utf8")) } : { strutture: {}, valori: {}, errori: {} };
+var METODO = 2;
+if (stato.metodo !== METODO) {
+  stato.strutture = {};
+  stato.valori = {};
+  stato.errori = {};
+  stato.metodo = METODO;
+}
 var inizio = Date.now();
 var richieste = 0;
 var fermati = null;
@@ -717,14 +788,37 @@ function erroreRecente(id) {
   return Date.now() - Date.parse(e.il) < giorni * 864e5 - 36e5;
 }
 async function scaricaStruttura(item) {
-  const url = item.structureId ? `${BASE}/datastructure/IT1/${encodeURIComponent(item.structureId)}?references=children` : `${BASE}/dataflow/IT1/${encodeURIComponent(item.id)}?references=descendants&detail=full`;
   const t0 = Date.now();
   try {
-    const { status, text } = await istat(url, "application/xml", T_STRUTTURA);
-    if (status !== 200) throw new Error(`HTTP ${status}`);
-    const s = buildFlowStructure(item.id, parseSdmxStructureXml(text));
-    if (s.dimensions.length === 0) throw new Error("struttura vuota");
-    if (!s.dimensions.some((d) => d.isTerritory)) throw new Error("senza territori");
+    const dsdUrl = item.structureId ? `${BASE}/datastructure/IT1/${encodeURIComponent(item.structureId)}` : `${BASE}/dataflow/IT1/${encodeURIComponent(item.id)}?references=datastructure`;
+    const d = await istat(dsdUrl, "application/xml", T_STRUTTURA);
+    if (d.status !== 200) throw new Error(`HTTP ${d.status}`);
+    const dsd = buildFlowStructure(item.id, parseSdmxStructureXml(d.text));
+    if (dsd.dimensions.length === 0) throw new Error("struttura vuota");
+    if (!dsd.dimensions.some((x) => x.isTerritory)) throw new Error("senza territori");
+    let s = null;
+    let ultimo = "";
+    for (const territorio of ["IT", "ITC4", "ITH5"]) {
+      if (!puoContinuare()) break;
+      const key = dsd.dimensions.map((x) => x.isTerritory ? territorio : "").join(".");
+      const r = await istat(
+        `${BASE}/data/${encodeURIComponent(item.id)}/${encodeURIComponent(key)}?lastNObservations=1&dimensionAtObservation=AllDimensions`,
+        ACCEPT_SDMX_JSON,
+        T_DATI
+      );
+      if (r.status !== 200) {
+        ultimo = `HTTP ${r.status}`;
+        continue;
+      }
+      const sample = parseSdmxJsonData(r.text);
+      if (sample.rows.length === 0) {
+        ultimo = "campione vuoto";
+        continue;
+      }
+      s = structureFromSample(item.id, dsd, sample);
+      break;
+    }
+    if (!s) throw new Error(ultimo || "campione non disponibile");
     scrivi(`strutture/${item.id}.json`, slimStructure(s));
     stato.strutture[item.id] = { up: item.lastUpdate, il: (/* @__PURE__ */ new Date()).toISOString() };
     delete stato.errori[item.id];
@@ -746,8 +840,8 @@ async function scaricaValori(item, structure) {
   const s = applyCatalogNotes(structure, item);
   const sel = defaultSelection(s);
   const tentativi = [
-    { nome: "larga", key: buildWideKey(s, sel), struttura: s },
-    { nome: "filtri", key: buildSeriesKey(s, sel), struttura: s }
+    { nome: "filtri", key: buildSeriesKey(s, sel), struttura: s },
+    { nome: "larga", key: buildWideKey(s, sel), struttura: s }
   ];
   let ultimoErrore = "";
   for (let i = 0; i < tentativi.length + 1; i++) {
@@ -763,7 +857,7 @@ async function scaricaValori(item, structure) {
     const url = `${BASE}/data/${encodeURIComponent(item.id)}/${encodeURIComponent(t.key)}?lastNObservations=1&dimensionAtObservation=AllDimensions`;
     const t0 = Date.now();
     try {
-      const { status, text } = await istat(url, "application/vnd.sdmx.data+csv;version=1.0.0", T_DATI);
+      const { status, text } = await istat(url, ACCEPT_SDMX_CSV, T_DATI);
       if (status !== 200) throw new Error(`HTTP ${status}`);
       const parsed = parseCsvText(text, `${item.id}.csv`);
       if (parsed.rows.length === 0) throw new Error("risposta vuota");
@@ -820,6 +914,24 @@ async function main() {
   const catalog = parseDataflowCatalogPayload(text);
   if (catalog.length < 100) throw new Error(`Catalogo sospetto: solo ${catalog.length} dataset`);
   log(`Catalogo: ${catalog.length} dataset`);
+  const territoriPath = path.join(OUT, "territori.json");
+  const vecchio = fs.existsSync(territoriPath) && Date.now() - fs.statSync(territoriPath).mtimeMs < 7 * 864e5;
+  if (!vecchio && puoContinuare()) {
+    try {
+      const r = await istat(`${BASE}/codelist/IT1/CL_ITTER107`, "application/xml", T_CATALOGO);
+      if (r.status === 200) {
+        const codes = parseSdmxStructureXml(r.text).codelists.get("CL_ITTER107");
+        if (codes && codes.size > 0) {
+          const nuts = Object.fromEntries(Array.from(codes).filter(([c]) => /^IT[A-Z0-9]*$/i.test(c)));
+          scrivi("territori.json", nuts);
+          log(`territori.json: ${Object.keys(nuts).length} codici`);
+        }
+      }
+    } catch (err) {
+      if (err instanceof StopError) throw err;
+      log("territori.json non aggiornato");
+    }
+  }
   const principali = scegliPrincipali(catalog, PRINCIPALI);
   const altri = territoriali(catalog).filter((c) => !principali.includes(c));
   try {
