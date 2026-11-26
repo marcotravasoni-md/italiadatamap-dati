@@ -180,10 +180,21 @@ var SdmxRateLimiter = class {
       isLimited: remaining === 0
     };
   }
-  async schedule(fn, nowProvider = () => Date.now()) {
+  /**
+   * Esegue la richiesta rispettando il limite. Di norma aspetta il proprio turno (le richieste
+   * restano in coda, una dopo l'altra); con wait=false rifiuta subito con errore rate_limit.
+   */
+  async schedule(fn, nowProvider = () => Date.now(), opts = {}) {
+    const wait = opts.wait ?? true;
+    const sleep2 = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
     const run = this.queue.then(async () => {
-      const now = nowProvider();
-      const status = this.getStatus(now);
+      let now = nowProvider();
+      let status = this.getStatus(now);
+      for (let tries = 0; wait && status.isLimited && tries < 3; tries++) {
+        await sleep2(status.resetInSeconds * 1e3 + 250);
+        now = nowProvider();
+        status = this.getStatus(now);
+      }
       if (status.isLimited) {
         throw new SdmxClientError(
           "rate_limit",
@@ -643,6 +654,7 @@ function structureFromSample(flowId, dsd, sample) {
   const latest = time?.values.map((v) => v.code).sort().pop();
   return {
     flowId,
+    metodo: 2,
     latestPeriod: latest,
     dimensions: dsd.dimensions.map((d) => {
       const got = byId.get(d.id);
