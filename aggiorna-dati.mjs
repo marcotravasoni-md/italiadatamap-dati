@@ -68,6 +68,58 @@ var viewKey = (level, parentCode) => `${level}::${parentCode ?? "root"}`;
 var cache = /* @__PURE__ */ new Map();
 cache.set(viewKey("regione", null), toLevelMap(italia_default, "regione", null, "Italia \u2014 Regioni"));
 
+// src/core/dataEngine.ts
+function splitCsvLine(line, delimiter) {
+  const result = [];
+  let current = "";
+  let inQuotes = false;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        current += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+    } else if (ch === delimiter && !inQuotes) {
+      result.push(current.trim());
+      current = "";
+    } else {
+      current += ch;
+    }
+  }
+  result.push(current.trim());
+  return result;
+}
+function parseCsvText(rawText, fileName = "dataset.csv") {
+  const cleaned = rawText.replace(/^\uFEFF/, "").trim();
+  if (!cleaned) {
+    return { fileName, headers: [], rows: [], delimiter: ";" };
+  }
+  const lines = cleaned.split(/\r?\n/).map((l) => l.trim()).filter((l) => l.length > 0);
+  if (lines.length === 0) {
+    return { fileName, headers: [], rows: [], delimiter: ";" };
+  }
+  const firstLine = lines[0];
+  const semicolonCount = (firstLine.match(/;/g) ?? []).length;
+  const commaCount = (firstLine.match(/,/g) ?? []).length;
+  const delimiter = semicolonCount >= commaCount ? ";" : ",";
+  const headers = splitCsvLine(firstLine, delimiter).map(
+    (h, idx2) => h ? h : `colonna_${idx2 + 1}`
+  );
+  const rows = [];
+  for (let i = 1; i < lines.length; i++) {
+    const cells = splitCsvLine(lines[i], delimiter);
+    const rowObj = {};
+    headers.forEach((h, idx2) => {
+      rowObj[h] = cells[idx2] ?? "";
+    });
+    rows.push(rowObj);
+  }
+  return { fileName, headers, rows, delimiter };
+}
+
 // src/services/datiPreparati.ts
 function toCompactRow(item, published = {}) {
   const extra = {};
@@ -490,6 +542,36 @@ function defaultSelection(structure) {
   }
   return sel;
 }
+function pickSingleSeries(rows, structure, selection) {
+  let out = rows;
+  for (const d of structure.dimensions) {
+    if (d.isTerritory || out.length === 0 || !(d.id in out[0])) continue;
+    const present = Array.from(new Set(out.map((r) => r[d.id])));
+    if (present.length <= 1) continue;
+    const wanted = selection[d.id];
+    let code = wanted && present.includes(wanted) ? wanted : "";
+    if (!code) {
+      const labels = new Map(d.values.map((v) => [v.code, v.label]));
+      code = pickDefaultCode(
+        d.id,
+        present.map((c) => ({ code: c, label: labels.get(c) ?? c }))
+      );
+    }
+    out = out.filter((r) => r[d.id] === code);
+  }
+  return out;
+}
+function buildWideKey(structure, selection) {
+  return structure.dimensions.map((d) => d.id.toUpperCase() === "FREQ" ? selection[d.id] || d.defaultCode || "" : "").join(".");
+}
+function selectionFromRows(structure, rows) {
+  const sel = {};
+  for (const d of structure.dimensions) {
+    if (d.isTerritory) continue;
+    sel[d.id] = rows.length > 0 && d.id in rows[0] ? rows[0][d.id] : "";
+  }
+  return sel;
+}
 function buildSeriesKey(structure, selection) {
   return structure.dimensions.map((d) => d.isTerritory ? "" : selection[d.id] ?? d.defaultCode ?? "").join(".");
 }
@@ -630,7 +712,9 @@ var leggi = (rel) => {
 };
 function erroreRecente(id) {
   const e = stato.errori[id];
-  return !!e && Date.now() - Date.parse(e.il) < RIPROVA_ERRORI_GIORNI * 864e5;
+  if (!e) return false;
+  const giorni = e.tipo === "valori" ? 1 : RIPROVA_ERRORI_GIORNI;
+  return Date.now() - Date.parse(e.il) < giorni * 864e5 - 36e5;
 }
 async function scaricaStruttura(item) {
   const url = item.structureId ? `${BASE}/datastructure/IT1/${encodeURIComponent(item.structureId)}?references=children` : `${BASE}/dataflow/IT1/${encodeURIComponent(item.id)}?references=descendants&detail=full`;
@@ -654,39 +738,60 @@ async function scaricaStruttura(item) {
     return null;
   }
 }
-async function scaricaValori(item, structure, ripiego = false) {
-  const s = ripiego ? structure : applyCatalogNotes(structure, item);
-  const key = buildSeriesKey(s, defaultSelection(s));
-  const url = `${BASE}/data/${encodeURIComponent(item.id)}/${encodeURIComponent(key)}?lastNObservations=1&dimensionAtObservation=AllDimensions`;
-  const t0 = Date.now();
-  try {
-    const { status, text } = await istat(url, "application/vnd.sdmx.data+csv;version=1.0.0", T_DATI);
-    if (status === 404) throw new Error("nessun dato con i filtri predefiniti");
-    if (status !== 200) throw new Error(`HTTP ${status}`);
-    if (text.trim().split("\n").length < 2) throw new Error("risposta vuota");
-    const out = {
-      id: item.id,
-      key,
-      fetchedAt: (/* @__PURE__ */ new Date()).toISOString(),
-      lastUpdate: item.lastUpdate,
-      csv: text
-    };
-    scrivi(`valori/${item.id}.json`, out);
-    stato.valori[item.id] = { up: item.lastUpdate, il: out.fetchedAt, key };
-    log(`valori ${item.id} ok: ${text.trim().split("\n").length - 1} righe (${Math.round((Date.now() - t0) / 1e3)} s)`);
-  } catch (err) {
-    if (err instanceof StopError) throw err;
-    const msg = err instanceof Error ? err.name === "AbortError" ? "tempo scaduto" : err.message : String(err);
-    if (!ripiego && /HTTP 500|HTTP 404|nessun dato|vuota/.test(msg) && puoContinuare()) {
-      log(`valori ${item.id}: ${msg}, cerco i valori disponibili\u2026`);
+function toCsv(headers, rows) {
+  const q = (v) => /[",\n\r]/.test(v) ? `"${v.replace(/"/g, '""')}"` : v;
+  return [headers.join(","), ...rows.map((r) => headers.map((h) => q(r[h] ?? "")).join(","))].join("\n") + "\n";
+}
+async function scaricaValori(item, structure) {
+  const s = applyCatalogNotes(structure, item);
+  const sel = defaultSelection(s);
+  const tentativi = [
+    { nome: "larga", key: buildWideKey(s, sel), struttura: s },
+    { nome: "filtri", key: buildSeriesKey(s, sel), struttura: s }
+  ];
+  let ultimoErrore = "";
+  for (let i = 0; i < tentativi.length + 1; i++) {
+    if (!puoContinuare()) return;
+    let t = tentativi[i];
+    if (!t) {
+      log(`valori ${item.id}: cerco i valori disponibili\u2026`);
       const disponibili = await valoriDisponibili(item.id);
-      if (disponibili && disponibili.size > 0) {
-        return scaricaValori(item, restrictToAvailable(structure, disponibili, item.defaults), true);
-      }
+      if (!disponibili || disponibili.size === 0) break;
+      const r = restrictToAvailable(s, disponibili, item.defaults);
+      t = { nome: "disponibili", key: buildSeriesKey(r, defaultSelection(r)), struttura: r };
     }
-    stato.errori[item.id] = { il: (/* @__PURE__ */ new Date()).toISOString(), tipo: "valori", msg };
-    log(`valori ${item.id} errore: ${msg}`);
+    const url = `${BASE}/data/${encodeURIComponent(item.id)}/${encodeURIComponent(t.key)}?lastNObservations=1&dimensionAtObservation=AllDimensions`;
+    const t0 = Date.now();
+    try {
+      const { status, text } = await istat(url, "application/vnd.sdmx.data+csv;version=1.0.0", T_DATI);
+      if (status !== 200) throw new Error(`HTTP ${status}`);
+      const parsed = parseCsvText(text, `${item.id}.csv`);
+      if (parsed.rows.length === 0) throw new Error("risposta vuota");
+      const scelte = pickSingleSeries(parsed.rows, t.struttura, defaultSelection(t.struttura));
+      if (scelte.length === 0) throw new Error("nessuna serie utilizzabile");
+      const usata = { ...defaultSelection(t.struttura), ...selectionFromRows(t.struttura, scelte) };
+      const key = buildSeriesKey(t.struttura, usata);
+      const out = {
+        id: item.id,
+        key,
+        fetchedAt: (/* @__PURE__ */ new Date()).toISOString(),
+        lastUpdate: item.lastUpdate,
+        csv: toCsv(parsed.headers, scelte)
+      };
+      scrivi(`valori/${item.id}.json`, out);
+      stato.valori[item.id] = { up: item.lastUpdate, il: out.fetchedAt, key };
+      delete stato.errori[item.id];
+      log(
+        `valori ${item.id} ok (${t.nome}): ${scelte.length} territori su ${parsed.rows.length} righe (${Math.round((Date.now() - t0) / 1e3)} s)`
+      );
+      return;
+    } catch (err) {
+      if (err instanceof StopError) throw err;
+      ultimoErrore = err instanceof Error ? err.name === "AbortError" ? "tempo scaduto" : err.message : String(err);
+      log(`valori ${item.id} (${t.nome}): ${ultimoErrore}`);
+    }
   }
+  stato.errori[item.id] = { il: (/* @__PURE__ */ new Date()).toISOString(), tipo: "valori", msg: ultimoErrore || "non disponibile" };
 }
 async function valoriDisponibili(id) {
   try {
