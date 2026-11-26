@@ -76,6 +76,7 @@ function toCompactRow(item, published = {}) {
   if (item.dimensionIds) extra.dim = item.dimensionIds;
   if (item.defaults) extra.def = item.defaults;
   if (item.lastUpdate) extra.up = item.lastUpdate;
+  if (item.hiddenDims) extra.hid = item.hiddenDims;
   if (published.s) extra.s = 1;
   if (published.v) extra.v = 1;
   const name = item.name.replace(/\s*\([^()]*\)\s*$/, "");
@@ -157,6 +158,7 @@ var SdmxClientError = class extends Error {
 };
 function parseDataflowAnnotations(body) {
   const dims = /* @__PURE__ */ new Set();
+  const hidden = /* @__PURE__ */ new Set();
   const defaults = {};
   let lastUpdate;
   const annRe = /<(?:\w+:)?Annotation\b[^>]*>([\s\S]*?)<\/(?:\w+:)?Annotation>/gi;
@@ -172,6 +174,10 @@ function parseDataflowAnnotations(body) {
       continue;
     }
     if (!title) continue;
+    if (type === "NOT_DISPLAYED") {
+      for (const d of title.split(/[,;\s]+/)) if (/^[A-Z][A-Z0-9_]*$/.test(d) && !/^NOTE_/.test(d)) hidden.add(d);
+      continue;
+    }
     if (/^LAYOUT_(ROW|COLUMN|FILTER)/.test(type)) {
       for (const d of title.split(/[,;\s]+/)) if (/^[A-Z][A-Z0-9_]*$/.test(d) && d !== "TIME_PERIOD") dims.add(d);
     } else if (type === "DEFAULT") {
@@ -184,7 +190,8 @@ function parseDataflowAnnotations(body) {
   return {
     dimensionIds: dims.size > 0 ? Array.from(dims) : void 0,
     defaults: Object.keys(defaults).length > 0 ? defaults : void 0,
-    lastUpdate
+    lastUpdate,
+    hiddenDims: hidden.size > 0 ? Array.from(hidden) : void 0
   };
 }
 function parseDataflowCatalogPayload(payloadText) {
@@ -440,22 +447,46 @@ function buildFlowStructure(flowId, parsed) {
     earliestPeriod: parsed.timeRange?.start
   };
 }
+function applyCatalogNotes(structure, item) {
+  const hidden = new Set(item.hiddenDims ?? []);
+  const withHidden = hidden.size ? {
+    ...structure,
+    dimensions: structure.dimensions.map(
+      (d) => hidden.has(d.id) && !d.isTerritory ? { ...d, hidden: true, defaultCode: "" } : d
+    )
+  } : structure;
+  return applyPreferredDefaults(withHidden, item.defaults);
+}
 function applyPreferredDefaults(structure, preferred) {
   if (!preferred) return structure;
   return {
     ...structure,
     dimensions: structure.dimensions.map((d) => {
       const code = preferred[d.id];
-      if (d.isTerritory || !code) return d;
+      if (d.isTerritory || d.hidden || !code) return d;
       if (d.values.length > 0 && !d.values.some((v) => v.code === code)) return d;
       return { ...d, defaultCode: code };
     })
   };
 }
+function restrictToAvailable(structure, available, preferred) {
+  const restricted = {
+    ...structure,
+    dimensions: structure.dimensions.map((d) => {
+      const codes = available.get(d.id);
+      if (d.isTerritory || !codes || codes.length === 0) return d;
+      const set = new Set(codes);
+      const known = d.values.filter((v) => set.has(v.code));
+      const values = known.length > 0 ? known : codes.map((code) => ({ code, label: code }));
+      return { ...d, values, defaultCode: pickDefaultCode(d.id, values) };
+    })
+  };
+  return applyPreferredDefaults(restricted, preferred);
+}
 function defaultSelection(structure) {
   const sel = {};
   for (const d of structure.dimensions) {
-    if (!d.isTerritory) sel[d.id] = d.defaultCode;
+    if (!d.isTerritory) sel[d.id] = d.hidden ? "" : d.defaultCode;
   }
   return sel;
 }
@@ -540,6 +571,7 @@ var PRINCIPALI = Number(opt("principali", 60));
 var BASE = String(opt("base", PUBLIC_ISTAT_SDMX_BASE_URL));
 var T_STRUTTURA = 18e4;
 var T_DATI = 18e4;
+var T_DISPONIBILI = 3e5;
 var T_CATALOGO = 15 * 6e4;
 var RIPROVA_ERRORI_GIORNI = 7;
 var statoPath = path.join(OUT, "stato.json");
@@ -622,8 +654,8 @@ async function scaricaStruttura(item) {
     return null;
   }
 }
-async function scaricaValori(item, structure) {
-  const s = applyPreferredDefaults(structure, item.defaults);
+async function scaricaValori(item, structure, ripiego = false) {
+  const s = ripiego ? structure : applyCatalogNotes(structure, item);
   const key = buildSeriesKey(s, defaultSelection(s));
   const url = `${BASE}/data/${encodeURIComponent(item.id)}/${encodeURIComponent(key)}?lastNObservations=1&dimensionAtObservation=AllDimensions`;
   const t0 = Date.now();
@@ -645,8 +677,29 @@ async function scaricaValori(item, structure) {
   } catch (err) {
     if (err instanceof StopError) throw err;
     const msg = err instanceof Error ? err.name === "AbortError" ? "tempo scaduto" : err.message : String(err);
+    if (!ripiego && /HTTP 500|HTTP 404|nessun dato|vuota/.test(msg) && puoContinuare()) {
+      log(`valori ${item.id}: ${msg}, cerco i valori disponibili\u2026`);
+      const disponibili = await valoriDisponibili(item.id);
+      if (disponibili && disponibili.size > 0) {
+        return scaricaValori(item, restrictToAvailable(structure, disponibili, item.defaults), true);
+      }
+    }
     stato.errori[item.id] = { il: (/* @__PURE__ */ new Date()).toISOString(), tipo: "valori", msg };
     log(`valori ${item.id} errore: ${msg}`);
+  }
+}
+async function valoriDisponibili(id) {
+  try {
+    const { status, text } = await istat(
+      `${BASE}/availableconstraint/${encodeURIComponent(id)}/?references=none&mode=available`,
+      "application/xml",
+      T_DISPONIBILI
+    );
+    if (status !== 200) return null;
+    return parseSdmxStructureXml(text).availableValues;
+  } catch (err) {
+    if (err instanceof StopError) throw err;
+    return null;
   }
 }
 function strutturaSalvata(id) {
