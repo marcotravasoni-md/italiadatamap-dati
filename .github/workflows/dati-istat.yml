@@ -36,12 +36,15 @@ jobs:
           rm -rf sito/.git
 
       - name: Aggiorna da ISTAT
-        run: node aggiorna-dati.mjs --out sito --budget "${{ github.event.inputs.budget || '200' }}" --ore 5
+        # Da GitHub ISTAT risponde 500: si passa dall'intermediario dell'app su Cloudflare.
+        run: node aggiorna-dati.mjs --out sito --budget "${{ github.event.inputs.budget || '200' }}" --ore 5 --base https://mappe.metodo-software.com/api/istat
 
       - name: Pubblica su GitHub Pages (ramo gh-pages, un solo commit)
         if: always()
         run: |
           test -f sito/catalogo.json || { echo "Niente da pubblicare"; exit 0; }
+          # Giro andato male (0 valori o meno di prima): si tiene il sito pubblicato prima.
+          if [ -f NON_PUBBLICARE ]; then echo "Non pubblico: $(cat NON_PUBBLICARE)"; exit 0; fi
           cd sito
           git init -q -b gh-pages
           git config user.name "italiadatamap-bot"
