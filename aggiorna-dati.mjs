@@ -771,6 +771,42 @@ var INDICATORI_PRONTI = [
       ECON_ACTIVITY_NACE_2007: "551_553",
       SIZE_BY_NUMBER_ROOMS: "TOT"
     }
+  },
+  {
+    id: "auto",
+    titolo: "Automobili",
+    spiegazione: "Autovetture iscritte al Pubblico registro automobilistico",
+    dettaglio: "Comuni",
+    flowId: "41_993_DCIS_VEICOLIPRA_COM_1",
+    nomeDataset: "Veicoli iscritti al PRA",
+    filtri: { DATA_TYPE: "VEHICFLEET", VEHICLE_TYPE: "1" }
+  },
+  {
+    id: "auto-euro6",
+    titolo: "Automobili Euro 6",
+    spiegazione: "Autovetture della classe ambientale pi\xF9 recente",
+    dettaglio: "Comuni",
+    flowId: "41_993_DCIS_VEICOLIPRA_COM_1",
+    nomeDataset: "Veicoli iscritti al PRA",
+    filtri: { DATA_TYPE: "VEHICFLEET", VEHICLE_TYPE: "19" }
+  },
+  {
+    id: "reddito-imponibile",
+    titolo: "Reddito imponibile",
+    spiegazione: "Somma dei redditi dichiarati (IRPEF), in euro",
+    dettaglio: "Comuni",
+    flowId: "30_1008_DF_MEF_REDDITIIRPEF_COM_1",
+    nomeDataset: "Redditi IRPEF dei comuni (MEF)",
+    filtri: { AMOUNT_CLASS: "TOTAL", DATA_TYPE: "TAXABINCR" }
+  },
+  {
+    id: "contribuenti",
+    titolo: "Contribuenti",
+    spiegazione: "Persone che presentano la dichiarazione dei redditi",
+    dettaglio: "Comuni",
+    flowId: "30_1008_DF_MEF_REDDITIIRPEF_COM_1",
+    nomeDataset: "Redditi IRPEF dei comuni (MEF)",
+    filtri: { AMOUNT_CLASS: "TOTAL", DATA_TYPE: "NTAXP" }
   }
 ];
 
@@ -791,6 +827,7 @@ var PRINCIPALI = Number(opt("principali", 60));
 var BASE = String(opt("base", PUBLIC_ISTAT_SDMX_BASE_URL));
 var T_STRUTTURA = 18e4;
 var T_DATI = 18e4;
+var T_VALORI = 12e5;
 var T_DISPONIBILI = 3e5;
 var T_CATALOGO = 15 * 6e4;
 var RIPROVA_ERRORI_GIORNI = 7;
@@ -830,7 +867,7 @@ async function istat(url, accept, timeoutMs) {
   const timer = setTimeout(() => ctrl.abort(), timeoutMs);
   try {
     const res = await fetch(url, {
-      headers: { Accept: accept, "Accept-Language": "it", "User-Agent": "ItaliaDataMap-dati (github.com/marcotravasoni-md)" },
+      headers: { Accept: accept, "Accept-Language": "it", "User-Agent": "ItaliaDataMap-dati (mappe.metodo-software.com)" },
       signal: ctrl.signal
     });
     if (res.status === 429) {
@@ -982,7 +1019,7 @@ async function scaricaValoriPronti(item, structure, filtri) {
   const url = `${BASE}/data/${encodeURIComponent(item.id)}/${encodeURIComponent(key)}?lastNObservations=1&dimensionAtObservation=AllDimensions`;
   const t0 = Date.now();
   try {
-    const { status, text } = await istat(url, ACCEPT_SDMX_CSV, T_DATI);
+    const { status, text } = await istat(url, ACCEPT_SDMX_CSV, T_VALORI);
     if (status !== 200) throw new Error(`HTTP ${status}`);
     const parsed = parseCsvText(text, `${item.id}.csv`);
     const scelte = pickSingleSeries(parsed.rows, s, sel);
